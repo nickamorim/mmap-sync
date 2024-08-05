@@ -7,8 +7,20 @@ description = "A Rust package allowing sharing of data between processes in a wa
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/cloudflare/mmap-sync"
-keywords = ["memory-mapping", "synchronization", "interprocess", "wait-free", "zero-copy"]
-categories = ["os", "filesystem", "concurrency", "data-structures", "memory-management"]
+keywords = [
+  "memory-mapping",
+  "synchronization",
+  "interprocess",
+  "wait-free",
+  "zero-copy",
+]
+categories = [
+  "os",
+  "filesystem",
+  "concurrency",
+  "data-structures",
+  "memory-management",
+]
 
 [dependencies]
 bytecheck = { version = "~0.6.8", default-features = false }
@@ -19,10 +31,20 @@ wyhash = "0.5.0"
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
-pprof = { version = "0.13.0", features = ["flamegraph", "protobuf-codec", "criterion"] }
+pprof = { version = "0.13.0", features = [
+  "flamegraph",
+  "protobuf-codec",
+  "criterion",
+] }
 proptest = "1.0.0"
 rand = "0.8.5"
 
 [[bench]]
 name = "synchronizer"
 harness = false
+
+[profile.release]
+codegen-units = 1
+debug = true
+lto = "fat"
+opt-level = 3
