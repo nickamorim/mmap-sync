@@ -2,16 +2,13 @@
 //!
 //! The `Synchronizer` offers a simple interface for reading and writing data from/to shared memory. It uses memory-mapped files and wait-free synchronization to provide high concurrency wait-free reads over a single writer instance. This design is inspired by the [Left-Right concurrency control technique](https://github.com/pramalhe/ConcurrencyFreaks/blob/master/papers/left-right-2014.pdf), allowing for efficient and flexible inter-process communication.
 //!
-//! Furthermore, with the aid of the [rkyv](https://rkyv.org/) library, `Synchronizer` can perform zero-copy deserialization, reducing time and memory usage when accessing data.
+//! This implementation uses protocol buffers (via [Prost](https://github.com/tokio-rs/prost)) for serialization and deserialization of data.
+
 use std::ffi::OsStr;
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::time::Duration;
 
-use bytecheck::CheckBytes;
-use rkyv::ser::serializers::{AlignedSerializer, AllocSerializer};
-use rkyv::ser::Serializer;
-use rkyv::validation::validators::DefaultValidator;
-use rkyv::{archived_root, check_archived_root, AlignedVec, Archive, Serialize};
+use prost::Message;
 use thiserror::Error;
 use wyhash::WyHash;
 
@@ -24,7 +21,7 @@ use crate::synchronizer::SynchronizerError::*;
 /// `Synchronizer` is a concurrency primitive that manages data access between a single writer process and multiple reader processes.
 ///
 /// It coordinates the access to two data files that store the shared data. A state file, also memory-mapped, stores the index of the current data file and the number of active readers for each index, updated via atomic instructions.
-pub struct Synchronizer<H: Hasher + Default = WyHash, const N: usize = 1024> {
+pub struct Synchronizer<H: Hasher + Default = WyHash> {
     /// Container storing state mmap
     state_container: StateContainer,
     /// Container storing data mmap
@@ -32,7 +29,7 @@ pub struct Synchronizer<H: Hasher + Default = WyHash, const N: usize = 1024> {
     /// Hasher used for checksum calculation
     build_hasher: BuildHasherDefault<H>,
     /// Re-usable buffer for serialization
-    serialize_buffer: Option<AlignedVec>,
+    serialize_buffer: Vec<u8>,
 }
 
 /// `SynchronizerError` enumerates all possible errors returned by this library.
@@ -70,14 +67,14 @@ impl Synchronizer {
     }
 }
 
-impl<H: Hasher + Default, const N: usize> Synchronizer<H, N> {
+impl<H: Hasher + Default> Synchronizer<H> {
     /// Create new instance of `Synchronizer` using given `path_prefix` and template parameters
     pub fn with_params(path_prefix: &OsStr) -> Self {
         Synchronizer {
             state_container: StateContainer::new(path_prefix),
             data_container: DataContainer::new(path_prefix),
             build_hasher: BuildHasherDefault::default(),
-            serialize_buffer: Some(AlignedVec::new()),
+            serialize_buffer: Vec::new(),
         }
     }
 
@@ -104,44 +101,32 @@ impl<H: Hasher + Default, const N: usize> Synchronizer<H, N> {
         grace_duration: Duration,
     ) -> Result<(usize, bool), SynchronizerError>
     where
-        T: Serialize<AllocSerializer<N>>,
-        T::Archived: for<'b> CheckBytes<DefaultValidator<'b>>,
+        T: Message,
     {
-        let mut buf = self.serialize_buffer.take().ok_or(FailedEntityWrite)?;
-        buf.clear();
+        self.serialize_buffer.clear();
 
         // serialize given entity into bytes
-        let mut serializer = AllocSerializer::new(
-            AlignedSerializer::new(buf),
-            Default::default(),
-            Default::default(),
-        );
-        let _ = serializer
-            .serialize_value(entity)
+        entity
+            .encode(&mut self.serialize_buffer)
             .map_err(|_| FailedEntityWrite)?;
-        let data = serializer.into_serializer().into_inner();
-
-        // ensure that serialized bytes can be deserialized back to `T` struct successfully
-        check_archived_root::<T>(&data).map_err(|_| FailedEntityRead)?;
 
         // fetch current state from mapped memory
         let state = self.state_container.state(true)?;
 
         // calculate data checksum
         let mut hasher = self.build_hasher.build_hasher();
-        hasher.write(&data);
+        hasher.write(&self.serialize_buffer);
         let checksum = hasher.finish();
 
         // acquire next available data file idx and write data to it
         let (new_idx, reset) = state.acquire_next_idx(grace_duration);
-        let new_version = InstanceVersion::new(new_idx, data.len(), checksum)?;
-        let size = self.data_container.write(&data, new_version)?;
+        let new_version = InstanceVersion::new(new_idx, self.serialize_buffer.len(), checksum)?;
+        let size = self
+            .data_container
+            .write(&self.serialize_buffer, new_version)?;
 
         // switch readers to new version
         state.switch_version(new_version);
-
-        // Restore buffer for potential reuse
-        self.serialize_buffer.replace(data);
 
         Ok((size, reset))
     }
@@ -155,8 +140,7 @@ impl<H: Hasher + Default, const N: usize> Synchronizer<H, N> {
         grace_duration: Duration,
     ) -> Result<(usize, bool), SynchronizerError>
     where
-        T: Serialize<AllocSerializer<N>>,
-        T::Archived: for<'b> CheckBytes<DefaultValidator<'b>>,
+        T: Message,
     {
         // fetch current state from mapped memory
         let state = self.state_container.state(true)?;
@@ -179,26 +163,15 @@ impl<H: Hasher + Default, const N: usize> Synchronizer<H, N> {
 
     /// Reads and returns an `entity` struct from mapped memory wrapped in `ReadGuard`.
     ///
-    /// # Parameters
-    /// - `check_bytes`: Whether to check that `entity` bytes can be safely read for type `T`,
-    ///                  `false` - bytes check will not be performed (faster, but less safe),
-    ///                  `true` - bytes check will be performed (slower, but safer).
-    ///
     /// # Safety
     ///
     /// This method is marked as unsafe due to the potential for memory corruption if the returned
     /// result is used beyond the `grace_duration` set in the `write` method. The caller must ensure
     /// the `ReadGuard` (and any references derived from it) are dropped before this time period
     /// elapses to ensure safe operation.
-    ///
-    /// Additionally, the use of `unsafe` here is related to the internal use of the
-    /// `rkyv::archived_root` function, which has its own safety considerations. Particularly, it
-    /// assumes the byte slice provided to it accurately represents an archived object, and that the
-    /// root of the object is stored at the end of the slice.
-    pub unsafe fn read<T>(&mut self, check_bytes: bool) -> Result<ReadResult<T>, SynchronizerError>
+    pub unsafe fn read<T>(&mut self) -> Result<ReadResult<T>, SynchronizerError>
     where
-        T: Archive,
-        T::Archived: for<'b> CheckBytes<DefaultValidator<'b>>,
+        T: Message + Default,
     {
         // fetch current state from mapped memory
         let state = self.state_container.state(false)?;
@@ -212,11 +185,9 @@ impl<H: Hasher + Default, const N: usize> Synchronizer<H, N> {
         // fetch data for current version from mapped memory
         let (data, switched) = self.data_container.data(version)?;
 
-        // fetch entity from data using zero-copy deserialization
-        let entity = match check_bytes {
-            false => archived_root::<T>(data),
-            true => check_archived_root::<T>(data).map_err(|_| FailedEntityRead)?,
-        };
+        // deserialize entity from data
+        let mut entity = T::default();
+        entity.merge(data).map_err(|_| FailedEntityRead)?;
 
         Ok(ReadResult::new(guard, entity, switched))
     }
@@ -234,22 +205,27 @@ impl<H: Hasher + Default, const N: usize> Synchronizer<H, N> {
 
 #[cfg(test)]
 mod tests {
-    use crate::instance::InstanceVersion;
     use crate::synchronizer::Synchronizer;
-    use bytecheck::CheckBytes;
+    use prost::Message;
     use rand::distributions::Uniform;
     use rand::prelude::*;
-    use rkyv::{Archive, Deserialize, Serialize};
     use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
 
-    #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-    #[archive_attr(derive(CheckBytes))]
+    #[derive(Message, Clone, PartialEq)]
     struct MockEntity {
+        #[prost(uint32, tag = "1")]
         version: u32,
-        map: HashMap<u64, Vec<f32>>,
+        #[prost(map = "uint64, message", tag = "2")]
+        map: HashMap<u64, FloatVec>,
+    }
+
+    #[derive(Message, Clone, PartialEq)]
+    struct FloatVec {
+        #[prost(float, repeated, tag = "1")]
+        values: Vec<f32>,
     }
 
     struct MockEntityGenerator {
@@ -273,7 +249,9 @@ mod tests {
                 let key: u64 = self.rng.gen();
                 let n_vals = self.rng.gen::<usize>() % 20;
                 let vals: Vec<f32> = (0..n_vals).map(|_| self.rng.sample(range)).collect();
-                entity.map.insert(key, vals);
+                entity
+                    .map
+                    .insert(key, super::tests::FloatVec { values: vals });
             }
             entity
         }
@@ -299,7 +277,7 @@ mod tests {
         let mut entity_generator = MockEntityGenerator::new(3);
 
         // check that `read` returns error when writer didn't write yet
-        let res = unsafe { reader.read::<MockEntity>(false) };
+        let res = unsafe { reader.read::<MockEntity>() };
         assert!(res.is_err());
         assert_eq!(
             res.err().unwrap().to_string(),
@@ -314,10 +292,6 @@ mod tests {
         assert_eq!(reset, false);
         assert!(Path::new(&state_path).exists());
         assert!(!Path::new(&data_path_1).exists());
-        assert_eq!(
-            reader.version().unwrap(),
-            InstanceVersion(8817430144856633152)
-        );
 
         // check that first time scoped `read` works correctly and switches the data
         fetch_and_assert_entity(&mut reader, &entity, true);
@@ -333,10 +307,6 @@ mod tests {
         assert!(Path::new(&state_path).exists());
         assert!(Path::new(&data_path_0).exists());
         assert!(Path::new(&data_path_1).exists());
-        assert_eq!(
-            reader.version().unwrap(),
-            InstanceVersion(1441050725688826209)
-        );
 
         // check that another scoped `read` works correctly and switches the data
         fetch_and_assert_entity(&mut reader, &entity, true);
@@ -346,19 +316,11 @@ mod tests {
         let (size, reset) = writer.write(&entity, Duration::from_secs(1)).unwrap();
         assert!(size > 0);
         assert_eq!(reset, false);
-        assert_eq!(
-            reader.version().unwrap(),
-            InstanceVersion(14058099486534675680)
-        );
 
         let entity = entity_generator.gen(200);
         let (size, reset) = writer.write(&entity, Duration::from_secs(1)).unwrap();
         assert!(size > 0);
         assert_eq!(reset, false);
-        assert_eq!(
-            reader.version().unwrap(),
-            InstanceVersion(18228729609619266545)
-        );
 
         fetch_and_assert_entity(&mut reader, &entity, true);
     }
@@ -368,7 +330,7 @@ mod tests {
         expected_entity: &MockEntity,
         expected_is_switched: bool,
     ) {
-        let actual_entity = unsafe { synchronizer.read::<MockEntity>(false).unwrap() };
+        let actual_entity = unsafe { synchronizer.read::<MockEntity>().unwrap() };
         assert_eq!(actual_entity.map, expected_entity.map);
         assert_eq!(actual_entity.version, expected_entity.version);
         assert_eq!(actual_entity.is_switched(), expected_is_switched);

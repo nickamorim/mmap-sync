@@ -1,10 +1,9 @@
-use bytecheck::CheckBytes;
-use rkyv::{Archive, Deserialize, Serialize};
+use prost::Message;
 
-/// Example data-structure shared between writer and reader(s)
-#[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive_attr(derive(CheckBytes))]
+#[derive(Message, PartialEq)]
 pub struct HelloWorld {
+    #[prost(uint32, tag = "1")]
     pub version: u32,
+    #[prost(string, repeated, tag = "2")]
     pub messages: Vec<String>,
 }

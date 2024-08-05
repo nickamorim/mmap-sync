@@ -12,14 +12,14 @@
 //!
 //! The `synchronizer` module utilizes this `guard` module to manage memory safety, allowing
 //! users to focus on their application logic.
-use rkyv::{Archive, Archived};
+use prost::Message;
 use std::ops::Deref;
 
 use crate::instance::InstanceVersion;
 use crate::state::State;
 use crate::synchronizer::SynchronizerError;
 
-/// An RAII implementation of a “scoped read lock” of a `State`
+/// An RAII implementation of a "scoped read lock" of a `State`
 pub(crate) struct ReadGuard<'a> {
     state: &'a mut State,
     version: InstanceVersion,
@@ -44,15 +44,15 @@ impl<'a> Drop for ReadGuard<'a> {
 }
 
 /// `Synchronizer` result
-pub struct ReadResult<'a, T: Archive> {
+pub struct ReadResult<'a, T: Message + Default> {
     _guard: ReadGuard<'a>,
-    entity: &'a Archived<T>,
+    entity: T,
     switched: bool,
 }
 
-impl<'a, T: Archive> ReadResult<'a, T> {
+impl<'a, T: Message + Default> ReadResult<'a, T> {
     /// Creates new `ReadResult` with specified parameters
-    pub(crate) fn new(_guard: ReadGuard<'a>, entity: &'a Archived<T>, switched: bool) -> Self {
+    pub(crate) fn new(_guard: ReadGuard<'a>, entity: T, switched: bool) -> Self {
         ReadResult {
             _guard,
             entity,
@@ -66,11 +66,11 @@ impl<'a, T: Archive> ReadResult<'a, T> {
     }
 }
 
-impl<'a, T: Archive> Deref for ReadResult<'a, T> {
-    type Target = Archived<T>;
+impl<'a, T: Message + Default> Deref for ReadResult<'a, T> {
+    type Target = T;
 
     /// Dereferences stored `entity` for easier access
-    fn deref(&self) -> &Archived<T> {
-        self.entity
+    fn deref(&self) -> &T {
+        &self.entity
     }
 }
