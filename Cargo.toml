@@ -13,7 +13,7 @@ categories = ["os", "filesystem", "concurrency", "data-structures", "memory-mana
 [dependencies]
 bytecheck = { version = "~0.6.8", default-features = false }
 memmap2 = "0.9.4"
-rkyv = { version = "0.7.40", features = ["validation", "strict"] }
+prost = "0.13.1"
 thiserror = "1.0.30"
 wyhash = "0.5.0"
 
